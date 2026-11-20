@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
+from copy import deepcopy
 from dataclasses import InitVar, dataclass, field
 from functools import reduce
 from pathlib import Path
@@ -211,7 +212,7 @@ class SigmaCollection:
                         errors.extend(parsed_filter_rule.errors)  # Propagate errors from rule
                     else:  # merge with global rule and parse as simple rule
                         parsed_merged_rule = SigmaRule.from_dict(
-                            deep_dict_update(rule, global_rule),
+                            deep_dict_update(rule, deepcopy(global_rule)),
                             collect_errors,
                             source,
                             policy=policy,
@@ -221,14 +222,19 @@ class SigmaCollection:
                         prev_rule = rule
                 elif action == "global":  # set global rule template
                     del rule["action"]
-                    global_rule = rule
-                    prev_rule = global_rule
+                    # Keep the global template private: a deepcopy decouples it from the
+                    # source document and from prev_rule, so a later 'repeat' patch can
+                    # never mutate the template in place and contaminate following rules.
+                    global_rule = deepcopy(rule)
+                    prev_rule = deepcopy(global_rule)
                 elif action == "reset":  # remove global rule
                     global_rule = dict()
                 elif (
                     action == "repeat"
                 ):  # add content of current rule to previous rule and parse it
-                    prev_rule = deep_dict_update(prev_rule, rule)
+                    # Work on an independent copy so cumulative patches never alias the
+                    # global template (or any other state still referenced elsewhere).
+                    prev_rule = deep_dict_update(deepcopy(prev_rule), rule)
                     parsed_rule = SigmaRule.from_dict(
                         prev_rule, collect_errors, source, policy=policy
                     )

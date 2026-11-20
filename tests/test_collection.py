@@ -570,3 +570,196 @@ correlation:
     # references should be SigmaRuleReference objects and not yet resolved
     assert isinstance(corr.rules[0], SigmaRuleReference)
     assert not hasattr(corr.rules[0], "rule")
+
+
+# Minimal multi-document ruleset in which a 'repeat' patch document follows a
+# 'global' template document. Before the fix the patch mutated the shared global
+# template, so the ordinary rule after the patch silently inherited the patch's
+# identifier, title, description and detection logic.
+GLOBAL_PATCH_RULESET_DICTS = [
+    {
+        "action": "global",
+        "title": "Global Template Title",
+        "id": "11111111-1111-1111-1111-111111111111",
+        "description": "global template description",
+        "logsource": {"category": "template_cat"},
+        "detection": {
+            "global_sel": {"GlobalField": "global_value"},
+            "condition": "global_sel",
+        },
+    },
+    {
+        "action": "repeat",
+        "title": "Patch Title",
+        "id": "22222222-2222-2222-2222-222222222222",
+        "description": "patch description",
+        "detection": {
+            "patch_sel": {"PatchField": "patch_value"},
+            "condition": "patch_sel",
+        },
+    },
+    {
+        "logsource": {"category": "ordinary_cat"},
+    },
+]
+
+GLOBAL_PATCH_RULESET_YAML = """
+action: global
+title: Global Template Title
+id: 11111111-1111-1111-1111-111111111111
+description: global template description
+logsource:
+    category: template_cat
+detection:
+    global_sel:
+        GlobalField: global_value
+    condition: global_sel
+---
+action: repeat
+title: Patch Title
+id: 22222222-2222-2222-2222-222222222222
+description: patch description
+detection:
+    patch_sel:
+        PatchField: patch_value
+    condition: patch_sel
+---
+logsource:
+    category: ordinary_cat
+"""
+
+
+def test_global_template_not_mutated_by_repeat_patch_attributes():
+    """属性一致：补丁之后的普通规则必须与自身文档+模板一致，不继承补丁的标识/标题/描述。"""
+    collection = SigmaCollection.from_dicts([dict(doc) for doc in GLOBAL_PATCH_RULESET_DICTS])
+
+    assert len(collection) == 2
+    patched_rule, ordinary_rule = collection.rules
+
+    # The patch product keeps the cumulative merge (template + patch).
+    assert patched_rule.title == "Patch Title"
+    assert str(patched_rule.id) == "22222222-2222-2222-2222-222222222222"
+    assert patched_rule.description == "patch description"
+
+    # The ordinary rule after the patch keeps the template's global attributes.
+    assert ordinary_rule.title == "Global Template Title"
+    assert str(ordinary_rule.id) == "11111111-1111-1111-1111-111111111111"
+    assert ordinary_rule.description == "global template description"
+    # Global-merge semantics are unchanged: template leaves win for overlapping
+    # keys while document-only keys are retained.
+    assert ordinary_rule.logsource == SigmaLogSource(category="template_cat")
+
+
+def test_global_template_not_mutated_by_repeat_patch_detection():
+    """检测逻辑一致：补丁之后的普通规则检测逻辑必须来自模板，而非补丁的外来检测项。"""
+    collection = SigmaCollection.from_dicts([dict(doc) for doc in GLOBAL_PATCH_RULESET_DICTS])
+
+    ordinary_rule = collection.rules[1]
+    assert set(ordinary_rule.detection.detections.keys()) == {"global_sel"}
+    assert ordinary_rule.detection.condition == ["global_sel"]
+
+    # The patch product itself still carries the cumulative detection (template + patch).
+    patched_rule = collection.rules[0]
+    assert set(patched_rule.detection.detections.keys()) == {
+        "global_sel",
+        "patch_sel",
+    }
+    assert patched_rule.detection.condition == ["patch_sel"]
+
+
+def test_global_template_not_mutated_by_repeat_patch_unique_identifiers():
+    """标识唯一：规则集内规则标识不得因补丁串改而重复。"""
+    collection = SigmaCollection.from_dicts([dict(doc) for doc in GLOBAL_PATCH_RULESET_DICTS])
+
+    rule_ids = [str(rule.id) for rule in collection.rules]
+    assert rule_ids == [
+        "22222222-2222-2222-2222-222222222222",
+        "11111111-1111-1111-1111-111111111111",
+    ]
+    assert len(rule_ids) == len(set(rule_ids))
+    # The id-indexed lookup must not silently alias two rules onto one identifier.
+    assert collection[UUID("11111111-1111-1111-1111-111111111111")] is collection.rules[1]
+
+
+def test_consecutive_repeat_patches_accumulate_without_template_mutation():
+    """连续补丁依次叠加的累积语义保持，且模板仍不被任何补丁改写。"""
+    ruleset = [
+        {
+            "action": "global",
+            "title": "Global Template Title",
+            "id": "11111111-1111-1111-1111-111111111111",
+            "logsource": {"category": "template_cat"},
+            "detection": {
+                "global_sel": {"GlobalField": "global_value"},
+                "condition": "global_sel",
+            },
+        },
+        {
+            "action": "repeat",
+            "id": "22222222-2222-2222-2222-222222222222",
+            "detection": {
+                "patch_one": {"PatchOneField": "one"},
+                "condition": "patch_one",
+            },
+        },
+        {
+            "action": "repeat",
+            "id": "33333333-3333-3333-3333-333333333333",
+            "detection": {
+                "patch_two": {"PatchTwoField": "two"},
+                "condition": "patch_two",
+            },
+        },
+        {"logsource": {"category": "ordinary_cat"}},
+    ]
+
+    collection = SigmaCollection.from_dicts(ruleset)
+
+    assert len(collection) == 3
+    first_patch, second_patch, ordinary_rule = collection.rules
+
+    # First patch: template + first increment.
+    assert set(first_patch.detection.detections.keys()) == {
+        "global_sel",
+        "patch_one",
+    }
+    assert first_patch.detection.condition == ["patch_one"]
+    # Second patch: cumulative on top of the previous patch product.
+    assert set(second_patch.detection.detections.keys()) == {
+        "global_sel",
+        "patch_one",
+        "patch_two",
+    }
+    assert second_patch.detection.condition == ["patch_two"]
+    assert str(second_patch.id) == "33333333-3333-3333-3333-333333333333"
+
+    # The ordinary rule still sees the untouched template.
+    assert str(ordinary_rule.id) == "11111111-1111-1111-1111-111111111111"
+    assert set(ordinary_rule.detection.detections.keys()) == {"global_sel"}
+    assert ordinary_rule.detection.condition == ["global_sel"]
+
+    rule_ids = [str(rule.id) for rule in collection.rules]
+    assert len(rule_ids) == len(set(rule_ids))
+
+
+@pytest.mark.parametrize("round_no", range(10))
+def test_global_patch_ruleset_stable_across_ten_load_rounds(round_no):
+    """同一最小多文档规则集重复装载 10 轮，每轮结果保持稳定（YAML 装载入口）。"""
+    collection = SigmaCollection.from_yaml(GLOBAL_PATCH_RULESET_YAML)
+
+    assert len(collection) == 2
+
+    patched_rule, ordinary_rule = collection.rules
+    assert str(patched_rule.id) == "22222222-2222-2222-2222-222222222222"
+    assert patched_rule.title == "Patch Title"
+    assert patched_rule.description == "patch description"
+    assert patched_rule.detection.condition == ["patch_sel"]
+
+    assert str(ordinary_rule.id) == "11111111-1111-1111-1111-111111111111"
+    assert ordinary_rule.title == "Global Template Title"
+    assert ordinary_rule.description == "global template description"
+    assert ordinary_rule.detection.condition == ["global_sel"]
+    assert set(ordinary_rule.detection.detections.keys()) == {"global_sel"}
+
+    rule_ids = [str(rule.id) for rule in collection.rules]
+    assert len(rule_ids) == len(set(rule_ids))
